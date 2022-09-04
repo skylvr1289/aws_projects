@@ -1,0 +1,139 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Lambda function to delete redundant (non existing Lambda function's logs) /aws/lambda/* log groups"
+
+Parameters:
+  Regions:
+    Type: String
+    Description: "regions for which Cloud Watch Logs will be purged for non existing lambda functions"
+    Default: '["us-east-1","us-west-2","ap-southeast-2", "eu-west-2"]'
+  LambdaFunctionName:
+    Type: String
+    Description: "name of the lambda function. to avoid creating duplicate functions in same region"
+    Default: "autocleanup-DeleteRedundantLambdaCWLogsFunction"
+
+Resources:
+  #-------------------------------------------------------------------------------
+  # LAMBDA RESOURCES
+  #-------------------------------------------------------------------------------
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaLogCleanupFunctionAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Resource: "*"
+                Action:
+                  - lambda:ListFunctions
+                  - logs:DescribeLogGroups
+                  - logs:DeleteLogGroup
+                  - logs:DeleteLogStream
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          import logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO) 
+          
+          def lambda_handler(event, context):
+              print("Entered lambda_handler")
+              regions =json.loads(os.environ.get('REGIONS', '["us-west-2"]'))
+              for region in regions:
+                  delete_redundant_lambda_logs(region)
+                  
+          def delete_redundant_lambda_logs(region: str):
+              print(region)
+              lambda_client = boto3.client('lambda', region_name = region)
+              lambda_paginator = lambda_client.get_paginator('list_functions')
+              existing_functions = set()
+              page_count =0
+              count = 0
+              for response in lambda_paginator.paginate():
+                print('page: %s'%str(page_count))
+                page_count = page_count+1
+                for function in response['Functions']:
+                  count = count+1
+                  existing_functions.add(function['FunctionName'])
+          
+              print('Total valid existing functions: %s'%str(count))
+              # list all lambda log groups
+              cw_client = boto3.client('logs', region_name = region)
+              paginator = cw_client.get_paginator('describe_log_groups')
+              count = 0
+              deleted_logs = []
+              for page in paginator.paginate(logGroupNamePrefix = '/aws/lambda/'):
+                print('log page: '+ str(count))
+                count = count +1
+                for group in page['logGroups']:
+                  #'/aws/lambda/function_name'
+                  log_lambda_name = group['logGroupName'].split('/')[3]
+                  if(log_lambda_name not in existing_functions):
+                      print('deleting log group: %s' %{group['logGroupName']})
+                      cw_client.delete_log_group(logGroupName = group['logGroupName'])
+                      deleted_logs.append(group['logGroupName'])
+              print('deleted %s lambda log groups'%{len(deleted_logs)})
+      Description: !Sub "Lambda function to delete redundant lambda log groups in all CDP regions"
+      Handler: index.lambda_handler
+      Environment:
+        Variables:
+          REGIONS: !Ref Regions
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: python3.9
+      Timeout: 900
+
+  LambdaFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${LambdaFunction}"
+      RetentionInDays: 7
+  #-------------------------------------------------------------------------------
+  # EVENTS RESOURCES
+  #-------------------------------------------------------------------------------
+  LambdaScheduledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "ScheduledRule"
+      # every sunday 3:00 am, every month (UTC time)
+      # min hour day month day-of-week year
+      ScheduleExpression: !Sub 'cron(00 3 ? 1-12 1 *)'
+      State: "ENABLED"
+      Targets:
+        - Arn:
+            Fn::GetAtt:
+              - "LambdaFunction"
+              - "Arn"
+          Id: "LambdaFunction"
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 120
+            MaximumRetryAttempts: 2
+
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref "LambdaFunction"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn:
+        Fn::GetAtt:
+          - LambdaScheduledRule
+          - Arn
